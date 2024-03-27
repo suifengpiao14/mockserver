@@ -24,7 +24,8 @@ type Service struct {
 func (s *Service) Init() (err error) {
 	u, err := url.Parse(s.Host)
 	if err != nil {
-		return nil
+		err = errors.WithMessagef(err, "Service.Init Host:%s", s.Host)
+		return err
 	}
 	s.Host = u.Host
 	s.Apis.Init(s)
@@ -43,8 +44,12 @@ func (ss Services) Init() (err error) {
 	return nil
 }
 
-func (services *Services) AddReplace(subService ...Service) {
-	for _, imcomeService := range subService {
+func (services *Services) AddReplace(subServices ...Service) {
+	for _, imcomeService := range subServices {
+		err := imcomeService.Init()
+		if err != nil {
+			panic(err)
+		}
 		exists := false
 		for i, service := range *services {
 			if strings.EqualFold(imcomeService.Host, service.Host) {
@@ -113,10 +118,12 @@ func (api Api) Request2InputFeature(r *http.Request) (inputFeatures Feature, err
 	}
 	req, err := CopyRequest(r) // 复制一份，避免body被读取后不可再读等问题
 	if err != nil {
+		err = errors.WithMessagef(err, "CopyRequest,route:%s", api.Route())
 		return nil, err
 	}
 	inputFeatures, err = api.Request2inputFeatureFn(req)
 	if err != nil {
+		err = errors.WithMessagef(err, "api.Request2inputFeatureFn,route:%s", api.Route())
 		return nil, err
 	}
 	return inputFeatures, nil
@@ -298,6 +305,7 @@ func (tc TestCase) GetInput() (out []byte, err error) {
 	}
 	out, err = tc.InputFn(tc)
 	if err != nil {
+		err = errors.WithMessagef(err, "TestCase.InputFn,testCaseId:%s", tc.ID)
 		return nil, err
 	}
 	return out, nil
@@ -309,6 +317,7 @@ func (tc TestCase) GetOutput() (out []byte, err error) {
 	}
 	out, err = tc.OutputFn(tc)
 	if err != nil {
+		err = errors.WithMessagef(err, "TestCase.OutputFn,testCaseId:%s", tc.ID)
 		return nil, err
 	}
 	return out, nil
