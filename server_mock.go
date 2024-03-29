@@ -2,6 +2,7 @@ package mockserver
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/suifengpiao14/kvstruct"
@@ -129,6 +131,10 @@ func (api Api) Request2InputFeature(r *http.Request) (inputFeatures Feature, err
 	return inputFeatures, nil
 }
 
+var (
+	Header_Request_id = "RequestId"
+)
+
 //Handle 提取请求特征，匹配测试用例，生成返回数据
 func (api Api) Handle(w http.ResponseWriter, r *http.Request) (err error) {
 	cpyR, _ := CopyRequest(r)
@@ -138,11 +144,50 @@ func (api Api) Handle(w http.ResponseWriter, r *http.Request) (err error) {
 	}
 	var testCaseRef *TestCase
 	var out []byte
+	var header http.Header
 	defer func() {
-		logInfo.err = err
+		var testCase TestCase
 		if testCaseRef != nil {
-			logInfo.TestCase = *testCaseRef
+			testCase = *testCaseRef
 		}
+		if err == nil {
+			requestHeader, _ := json.Marshal(r.Header)
+			var requestBody string
+			if cpyR.GetBody != nil {
+				body, err := cpyR.GetBody()
+				if err == nil {
+					b, _ := io.ReadAll(body)
+					requestBody = string(b)
+				}
+			}
+			responseHeader, _ := json.Marshal(w.Header())
+			_, testCaseInput, _ := testCase.GetInput()
+			_, testCaseOutput, _ := testCase.GetOutput()
+			path := "/"
+			if r.URL.Path != "" {
+				path = r.URL.Path
+			}
+
+			testCaseLog := TestCaseLog{
+				Host:           r.Host,
+				Method:         r.Method,
+				Path:           path,
+				RequestId:      r.Header.Get(Header_Request_id),
+				RequestHeader:  string(requestHeader),  // 实际输入请求头
+				RequestQuery:   r.URL.Query().Encode(), // 实际输入请求查询
+				RequestBody:    requestBody,            // 实际输入请求体
+				ResponseHeader: string(responseHeader), // 实际响应头
+				ResponseBody:   string(out),            // 实际响应体
+				TestCaseID:     testCase.ID,
+				Description:    testCase.Description,
+				TestCaseInput:  string(testCaseInput),                            // 当前测试用例期望的输入（作为服务时：可用于测试输入是否符合预期）
+				TestCaseOutput: string(testCaseOutput),                           // 当前测试用例期望的输出（作为客户端时：可用于测试真实服务端返回是否符合预期）
+				CreatedAt:      time.Now().Local().Format("2006-01-02 15:04:05"), // 当前测试用例期望的输出（作为客户端时：可用于测试真实服务端返回是否符合预期）
+			}
+			err = testCaseLog.Add(_db)
+		}
+		logInfo.err = err
+		logInfo.TestCase = testCase
 		logInfo.ResponseBody = out
 		logchan.SendLogInfo(&logInfo)
 	}()
@@ -155,12 +200,17 @@ func (api Api) Handle(w http.ResponseWriter, r *http.Request) (err error) {
 		return err
 	}
 
-	out, err = testCaseRef.GetOutput()
+	header, out, err = testCaseRef.GetOutput()
 	if err != nil {
 		return err
 	}
 
 	w.WriteHeader(http.StatusOK)
+	for k, head := range header {
+		for _, v := range head {
+			w.Header().Add(k, v)
+		}
+	}
 	w.Write(out)
 	return nil
 }
@@ -170,6 +220,7 @@ func (api Api) Route() (identify string) {
 }
 
 func route(path string, method string) (identify string) {
+	path = formatPath(path)
 	method = strings.ToUpper(method)
 	identify = fmt.Sprintf("%s-%s", path, method)
 	return identify
@@ -184,11 +235,21 @@ func (apis Apis) Init(s *Service) {
 	}
 }
 
+func formatPath(path string) (formatedPath string) {
+	if path == "" {
+		return "/"
+	}
+	return path
+}
+
 func (apis Apis) GetApi(r *http.Request) (api *Api, err error) {
-	path, method := r.URL.Path, r.Method
+	path, method := formatPath(r.URL.Path), r.Method
 	routeFeature := route(path, method)
+	hasApi := false
+	allFeatures := Feature{}
 	for _, api := range apis {
 		if strings.EqualFold(api.Route(), routeFeature) {
+			hasApi = true
 			allFeature, err := api.Request2InputFeature(r)
 			if err != nil {
 				return nil, err
@@ -196,9 +257,14 @@ func (apis Apis) GetApi(r *http.Request) (api *Api, err error) {
 			if allFeature.Contains(api.InputFeature) { // 判断api特征量
 				return &api, nil
 			}
+			allFeatures.Merge(allFeature)
 		}
 	}
-	err = errors.Errorf("not found api by path:%s,method:%s", path, method)
+	if hasApi {
+		err = errors.Errorf("not match api by path:%s,method:%s,routeFeature:%s", path, method, allFeatures.String())
+	} else {
+		err = errors.Errorf("not found api by path:%s,method:%s", path, method)
+	}
 	return nil, err
 }
 
@@ -218,27 +284,12 @@ func (apis *Apis) AddReplace(subApis ...Api) {
 	}
 }
 
-func Json2Feature(josnStr string) (feature Feature) {
+func KVS2Feature(kvs kvstruct.KVS) (feature Feature) {
 	feature = make(Feature)
-	kvs := kvstruct.JsonToKVS(josnStr, "")
 	for _, kv := range kvs {
 		feature[kv.Key] = kv.Value
 	}
 	return feature
-}
-
-func RequestBody2Feature(r *http.Request) (feature Feature, err error) {
-	if r.Body == nil {
-		return nil, nil
-	}
-	b, err := io.ReadAll(r.Body)
-	if err != nil {
-		return nil, err
-	}
-	r.Body.Close()
-	r.Body = io.NopCloser(bytes.NewReader(b)) //重新填写
-	feature = Json2Feature(string(b))
-	return feature, nil
 }
 
 //Feature 输入输出特征参数
@@ -271,56 +322,42 @@ func (feature *Feature) Merge(subFeature Feature) {
 }
 
 type TestCase struct {
-	ID            string                                   `json:"id"`            // 测试用例唯一标识
-	Description   string                                   `json:"description"`   //描述
-	InputFeature  Feature                                  `json:"inputFeature"`  //输入特征
-	OutputFeature Feature                                  `json:"outputFeature"` //输出特征
-	InputFn       func(t TestCase) (out []byte, err error) // 生成输入内容函数
-	OutputFn      func(t TestCase) (out []byte, err error) // 生成输出内容函数
+	ID            string                                                       `json:"id"`            // 测试用例唯一标识
+	Description   string                                                       `json:"description"`   //描述
+	InputFeature  Feature                                                      `json:"inputFeature"`  //输入特征
+	OutputFeature Feature                                                      `json:"outputFeature"` //输出特征
+	InputFn       func(t TestCase) (header http.Header, out []byte, err error) // 生成输入内容函数
+	OutputFn      func(t TestCase) (header http.Header, out []byte, err error) // 生成输出内容函数
 	api           *Api
-	//subscribers   []func(request *http.Request, response *http.Response)//   暂时通过日志实现该功能
 }
 
 func (tc TestCase) GetApi() (api *Api) {
 	return api
 }
 
-// //Subscribe 订阅输入输出数据 暂时通过日志实现该功能
-// func (tc *TestCase) Subscribe(subscriber func(request *http.Request, response *http.Response)) {
-// 	tc.subscribers = append(tc.subscribers, subscriber)
-// }
-
-// //Publish 将请求响应发布  暂时通过日志实现该功能
-// func (tc TestCase) Publish(request *http.Request, response *http.Response) {
-// 	for _, subscriber := range tc.subscribers {
-// 		r, _ := CopyRequest(request)
-// 		res, _ := CopyResponse(response)
-// 		subscriber(r, res)
-// 	}
-// }
-
-func (tc TestCase) GetInput() (out []byte, err error) {
+func (tc TestCase) GetInput() (header http.Header, out []byte, err error) {
 	if tc.InputFn == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
-	out, err = tc.InputFn(tc)
+	header, out, err = tc.InputFn(tc)
 	if err != nil {
 		err = errors.WithMessagef(err, "TestCase.InputFn,testCaseId:%s", tc.ID)
-		return nil, err
+		return nil, nil, err
 	}
-	return out, nil
+	return header, out, nil
 }
 
-func (tc TestCase) GetOutput() (out []byte, err error) {
+func (tc TestCase) GetOutput() (header http.Header, out []byte, err error) {
 	if tc.OutputFn == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
-	out, err = tc.OutputFn(tc)
+	header, out, err = tc.OutputFn(tc)
 	if err != nil {
 		err = errors.WithMessagef(err, "TestCase.OutputFn,testCaseId:%s", tc.ID)
-		return nil, err
+		return nil, nil, err
 	}
-	return out, nil
+
+	return header, out, nil
 }
 
 type TestCases []TestCase
@@ -361,21 +398,28 @@ const (
 	HTTP_MOCK_SERVER = "MOCKSERVER"
 )
 
-var _UseMockServer bool
+var _UseMockServerFilterFn func(r *http.Request) bool
 
 // SetUseMockServer 启用模拟服务
-func SetUseMockServer() {
-	_UseMockServer = true
+func SetUseMockServer(mockFilterFn func(r *http.Request) bool) {
+	_UseMockServerFilterFn = mockFilterFn
 }
 
 func CanUseMockServer(r *http.Request) bool {
-	return _UseMockServer
+	if _UseMockServerFilterFn == nil {
+		return false
+	}
+	return _UseMockServerFilterFn(r)
 }
 
 // CopyRequest 复制HTTP请求
 func CopyRequest(r *http.Request) (*http.Request, error) {
 	// 创建一个新的请求
-	req := &http.Request{}
+	req := &http.Request{
+		GetBody: func() (io.ReadCloser, error) {
+			return nil, nil
+		},
+	}
 
 	// 复制请求方法、URL和协议版本
 	req.Method = r.Method
@@ -405,6 +449,9 @@ func CopyRequest(r *http.Request) (*http.Request, error) {
 	r.Body = io.NopCloser(bytes.NewReader(body)) //重新填写
 	req.Body = io.NopCloser(bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
 	return req, nil
 }
 
